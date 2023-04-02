@@ -1,0 +1,185 @@
+# Pull a live site WordPress site into DDEV
+
+# Commands:
+#   'ddev pull ssh' - pulls a live wordpress site via SSH/mysqldump and rsync into DDEV.
+#   'ddev push ssh' - pushes the child theme folder to the remote server
+# Project repository: https://github.com/mandrasch/ddev-pull-wp-scripts
+
+# Requires DDEV version >= 1.18.2 !
+# https://github.com/drud/ddev/releases/tag/v1.18.2
+# https://ddev.readthedocs.io/en/stable/users/providers/provider-introduction/
+
+# ------------------------------   configuration  ---------------------------------------------
+environment_variables:
+  sshUser: XXXXXXXXXX
+  sshHost: XXXXXXX.net
+  sshWpPath: /home/sites/XXXXXXXXXXXXXXXXX/web/traintolake-api.mandrasch.eu
+  # path to wordpress on ssh server without(!) trailing slash, 
+  # e.g.: /var/www/html/my-website.eu
+
+  childThemeFolderName: train2lake-backend-wp
+  # just the folder name in wp-content/themes/, no slashes
+  # if you don't use a child theme currently, just leave 'twentytwentyone-child'
+
+# -----------------------------  eo configuration  -------------------------------------------
+
+# ---------  provider script  ---------
+# (Update the following code if 
+#  ddev-pull-wp-scripts gets an update)
+# -------------------------------------
+
+# 1. Add ssh keys to the user agent
+auth_command:
+  command: |
+    ssh-add -l >/dev/null || ( echo "Please 'ddev auth ssh' before running this command." && exit 1 )
+
+# 2. Pull a fresh database dump via SSH
+# 
+# Get db connection credentials via bash from wp-config.php on live server,
+# dump database via mysqldump to local .sql.gz file in .ddev/downloads
+# 
+# (Possible alternative: 'wp db export' command, not implemented yet because 
+#  detecting availability on remote server was not that easy)
+# 
+db_pull_command:
+  command: |
+    # set -x   # You can enable bash debugging output by uncommenting
+    set -eu -o pipefail
+    pushd "/var/www/html/${DDEV_DOCROOT}" >/dev/null
+    
+    # run shell commands on remote server for db dump (via heredoc structure)
+    # TODO: add support for mixed quotes / double quotes in wp-config.php?
+    (ssh ${sshUser}@${sshHost} "cd ${sshWpPath} && bash -s" <<'ENDSSH'
+      #set -x # uncomment for debug
+
+      # Only works with single quotes currently (no mixed quotes / double quotes)
+      DB_USER=$(cat wp-config.php | grep "'DB_USER'" | cut -d \' -f 4)
+      DB_PASSWORD=$(cat wp-config.php | grep "'DB_PASSWORD'" | cut -d \' -f 4)
+      DB_NAME=$(cat wp-config.php | grep "'DB_NAME'" | cut -d \' -f 4)
+      DB_HOST=$(cat wp-config.php | grep "'DB_HOST'" | cut -d \' -f 4)
+      DB_CHARSET=$(cat wp-config.php | grep "'DB_CHARSET'" | cut -d \' -f 4)
+
+      # special case, some hosters such as WPEngine have <host>:<port>,
+      DB_HOST=$(echo $DB_HOST| cut -d':' -f 1) # remove port
+
+      mysqldump \
+          --user $DB_USER \
+          --host $DB_HOST \
+          --default-character-set $DB_CHARSET \
+          --no-tablespaces \
+          --password="$DB_PASSWORD" $DB_NAME
+    ENDSSH
+    ) > .ddev/.downloads/db.sql
+    
+    # DDEV will import the db.sql.gz file automatically, compress it:
+    gzip -9 .ddev/.downloads/db.sql
+
+    # Thx to https://stackoverflow.com/a/45927977/809939
+    # Thx to https://www.cloudsavvyit.com/14216/how-to-run-a-local-shell-script-on-a-remote-ssh-server/
+
+  service: web
+
+# 3. Rsync all the files (except excludes)
+files_pull_command:
+  command: |
+    # set -x   # You can enable bash debugging output by uncommenting
+    set -eu -o pipefail
+    ls /var/www/html/.ddev >/dev/null 
+    pushd /var/www/html/${DDEV_DOCROOT} >/dev/null
+
+    # Add trailing slash for sshWpPath here in a safe way
+    # (maybe user mistakenly provided trailing slash, thx 
+    # https://gist.github.com/luciomartinez/c322327605d40f86ee0c)
+    [[ "${sshWpPath}" != */ ]] && sshWpPathTrailingSlash="${sshWpPath}/"
+
+    echo "Downloading files from remote site to /var/www/html/${DDEV_DOCROOT}"
+    # exclude child theme + some default locations of wordpress backup plugins
+    # (exclude pattern is glob based, not path based)
+    # add -v for output of files transferred, -vv for full debug
+    rsync -azh --stats \
+      --exclude=".git/" \
+      --exclude=".gitignore" \
+      --exclude=".ddev/" \
+      --exclude="README.md" \
+      --exclude="LICENSE" \
+      --exclude="wp-content/themes/${childThemeFolderName}" \
+      --exclude="wp-content/updraft" \
+      ${sshUser}@${sshHost}:${sshWpPathTrailingSlash} .
+
+    # TODO: Should we use -a (archive mode) or is there a better combination of flags?
+  service: web
+
+# 4. Set database connection + migrate URLs in DB
+# 
+# We use this step to run some important WP-CLI commands locally
+# a) Replace db connection settings in wp-config.php
+# b) Database migration: Replace live site url (from pulled wp-config)
+#    with DDEV_PRIMARY_URL (<your-project>.ddev.site) in local database
+# c) Overwrite WP_HOME and WP_SITEURL
+files_import_command:
+  command: |
+    # set -x  # You can enable bash debugging output by uncommenting
+    set -eu -o pipefail
+    pushd "/var/www/html/${DDEV_DOCROOT}" >/dev/null
+
+    echo "Adjusting wp-config db connection settings for DDEV ..."
+    wp config set DB_NAME "db" && wp config set DB_USER "db" && wp config set DB_PASSWORD "db" && wp config set DB_HOST "db"
+
+    # Important: Use wp search-replace for URL replacement
+    echo "Replacing the old URL ($(wp option get siteurl)) in database with DDEV local url (${DDEV_PRIMARY_URL})..."
+    wp search-replace $(wp option get siteurl) "${DDEV_PRIMARY_URL}"
+
+    # Additional update the wp config values, because some devs/hoster, e.g. raidboxes
+    # put it here (only remove if existent)
+    # TODO: if [wp config has] would be better, but how to implement it here?
+    # if [ "$(wp config has WP_HOME)" = 0 ]; then wp config delete WP_HOME; fi
+    # if [ "$(wp config has WP_SITEURL)" = 1 ]; then wp config delete WP_SITEURL; fi
+    # TODO: This throws a (false) error currently if var is not set, how do we get rid of it?
+    #       event with --no-add: 
+    #       Error: The constant or variable 'WP_HOME' is not defined in the 'wp-config.php' file.)
+    wp config set WP_HOME "${DDEV_PRIMARY_URL}"
+    wp config set WP_SITEURL "${DDEV_PRIMARY_URL}/"
+
+    # Flush object cache
+    wp cache flush
+
+    # Optional: more steps would be possible here after import, e.g. for WP Super Cache
+    # wp config delete WPCACHEHOME
+
+    echo "All set, have fun! Run 'ddev launch' to open your site."
+
+  service: web
+
+# ! EXPERIMENTAL - USE WITH CAUTION !
+# Push child theme folder to remote server
+# (Other reliable ways are WPPusher, Github Action pipeline, etc.)
+
+db_push_command:
+  command: |
+    # set -x   # You can enable bash debugging output by uncommenting
+    set -eu -o pipefail
+    echo "Skipping db_push_command, we don't use it."
+  service: web
+
+files_push_command:
+  command: |
+    # set -x   # You can enable bash debugging output by uncommenting
+    set -eu -o pipefail
+    pushd "/var/www/html/${DDEV_DOCROOT}" >/dev/null
+
+    # Add trailing slash for sshWpPath (maybe user mistakenly provided trailing slash) 
+    # (thx https://gist.github.com/luciomartinez/c322327605d40f86ee0c)
+    [[ "${sshWpPath}" != */ ]] && sshWpPathTrailingSlash="${sshWpPath}/"
+
+    # Send child theme from source (DDEV) to target (SSH server / webspace)
+    source="/var/www/html/${DDEV_DOCROOT}/wp-content/themes/${childThemeFolderName}/"
+    target="${sshUser}@${sshHost}:${sshWpPathTrailingSlash}wp-content/themes/${childThemeFolderName}"
+  
+    echo "Configuration for push:"
+    echo "Source: ${source}"
+    echo "Target: ${target}"
+    
+    echo "Start pushing the child theme folder..."
+    rsync -rvzh "${source}" "${target}"
+
+  service: web
