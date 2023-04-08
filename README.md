@@ -1,6 +1,6 @@
 # train2lake Backend WP
 
-Simple WordPress REST API backend for https://train2lake.vercel.app/, manages destinations via CPT and ACF Pro. You'll need an ACF Pro license.
+Simple WordPress REST API backend for https://train2lake.vercel.app/ (https://github.com/mandrasch/train2lake), manages destinations via CPT and ACF Pro. You'll need an ACF Pro license.
 
 ## Local setup
 
